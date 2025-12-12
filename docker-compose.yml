@@ -1,0 +1,45 @@
+version: '3.8'
+
+services:
+  # 1. Мозг кластера
+  dask-scheduler:
+    image: weather-app
+    build: .
+    command: dask-scheduler
+    ports:
+      - "8786:8786"
+      - "8787:8787" # Дэшборд
+    networks:
+      - data-net
+
+  # 2. Рабочие (масштабируемые)
+  dask-worker:
+    image: weather-app
+    build: .
+    command: dask-worker dask-scheduler:8786
+    volumes:
+      - ./data:/data # Видят скачанные файлы
+    depends_on:
+      - dask-scheduler
+    networks:
+      - data-net
+    deploy:
+      replicas: 2 # Два воркера для старта
+
+  # 3. Наш веб-сервис
+  api:
+    image: weather-app
+    build: .
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+    volumes:
+      - ./data:/data # Пишет скачанные файлы
+    ports:
+      - "8000:8000"
+    environment:
+      - DASK_SCHEDULER_ADDRESS=dask-scheduler:8786
+    networks:
+      - data-net
+
+networks:
+  data-net:
+
