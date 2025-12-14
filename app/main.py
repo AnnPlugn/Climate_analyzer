@@ -5,12 +5,17 @@ import dask.dataframe as dd
 from fastapi import FastAPI, HTTPException
 from dask.distributed import Client
 import time
+from datetime import datetime
+from app.database import init_db, save_dataframe_to_db, get_aggregated_data, clear_table
 
 app = FastAPI(title="Weather Dask ETL")
 
 # Настройки
 DASK_SCHEDULER = os.getenv("DASK_SCHEDULER_ADDRESS", "127.0.0.1:8786")
 DATA_DIR = "/data"
+
+# Инициализация базы данных при старте
+init_db()
 
 # Координаты городов для анализа
 CITIES = {
@@ -66,11 +71,17 @@ async def ingest_data(start_date: str = "2020-01-01", end_date: str = "2023-12-3
         # Это важно, чтобы Dask потом мог сгруппировать данные по городам
         df["city"] = city_name
         
-        # Сохранение (Partitioning): каждый город в свой файл
+        # Преобразование времени в datetime
+        df["time"] = pd.to_datetime(df["time"])
+        
+        # Сохранение в CSV (для Dask обработки)
         file_path = f"{DATA_DIR}/{city_name}.csv"
         df.to_csv(file_path, index=False)
         
-        summary.append(f"Saved {len(df)} rows for {city_name}")
+        # Сохранение в PostgreSQL
+        save_dataframe_to_db(df, "weather_data")
+        
+        summary.append(f"Saved {len(df)} rows for {city_name} (CSV + PostgreSQL)")
 
     return {"status": "Ingestion Complete", "details": summary}
 
@@ -104,7 +115,17 @@ async def analyze_weather():
     # Форматирование результата для JSON ответа
     # result - это обычный pandas dataframe (уже маленький)
     result.columns = ['_'.join(col).strip() for col in result.columns.values]
-    result_dict = result.reset_index().to_dict(orient="records")
+    
+    # Сохранение агрегированных данных в PostgreSQL
+    result_for_db = result.reset_index()
+    result_for_db.columns = ['city', 'temp_mean', 'temp_max', 'temp_min', 'humidity_mean']
+    result_for_db['last_updated'] = datetime.now()
+    
+    # Очищаем старые агрегированные данные и сохраняем новые
+    clear_table("weather_aggregated")
+    save_dataframe_to_db(result_for_db, "weather_aggregated")
+    
+    result_dict = result_for_db.to_dict(orient="records")
 
     return {
         "analysis_time_sec": round(duration, 4),
@@ -114,10 +135,28 @@ async def analyze_weather():
 
 @app.delete("/etl/clean")
 async def clean_data():
-    """Очистка скачанных данных"""
+    """Очистка скачанных данных (CSV и PostgreSQL)"""
     import glob
     files = glob.glob(f"{DATA_DIR}/*.csv")
     for f in files:
         os.remove(f)
-    return {"message": f"Deleted {len(files)} files"}
+    
+    # Очистка базы данных
+    clear_table("weather_data")
+    clear_table("weather_aggregated")
+    
+    return {"message": f"Deleted {len(files)} CSV files and cleared PostgreSQL tables"}
+
+@app.get("/etl/stats")
+async def get_stats():
+    """Получение статистики из PostgreSQL"""
+    try:
+        aggregated = get_aggregated_data()
+        return {
+            "status": "success",
+            "cities_count": len(aggregated),
+            "data": aggregated.to_dict(orient="records")
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 

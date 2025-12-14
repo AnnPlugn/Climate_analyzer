@@ -1,7 +1,30 @@
-version: '3.8'
-
 services:
-  # 1. Мозг кластера
+  # 0. База данных PostgreSQL
+  postgres:
+    image: postgres:15-alpine
+    container_name: weather_postgres
+    ports:
+      - "5433:5432"  # Изменен внешний порт на 5433, чтобы избежать конфликта с локальным PostgreSQL
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - data-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DATABASE_USERNAME:-postgres} -d ${DATABASE_NAME:-weather_db}"]
+      interval: 5s
+      timeout: 10s
+      retries: 10
+      start_period: 10s
+    env_file:
+      - .env
+    environment:
+      - POSTGRES_USER=${DATABASE_USERNAME:-postgres}
+      - POSTGRES_PASSWORD=${DATABASE_PASSWORD:-postgres}
+      - POSTGRES_DB=${DATABASE_NAME:-weather_db}
+      - POSTGRES_INITDB_ARGS=--encoding=UTF8 --locale=en_US.utf8
+    restart: unless-stopped
+
+  # 1. Мозг кластера Dask
   dask-scheduler:
     image: weather-app
     build: .
@@ -12,7 +35,7 @@ services:
     networks:
       - data-net
 
-  # 2. Рабочие (масштабируемые)
+  # 2. Рабочие Dask (масштабируемые)
   dask-worker:
     image: weather-app
     build: .
@@ -20,13 +43,22 @@ services:
     volumes:
       - ./data:/data # Видят скачанные файлы
     depends_on:
-      - dask-scheduler
+      dask-scheduler:
+        condition: service_started
+      postgres:
+        condition: service_healthy
     networks:
       - data-net
+    environment:
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_DB=${DATABASE_NAME:-weather_db}
+      - POSTGRES_USER=${DATABASE_USERNAME:-postgres}
+      - POSTGRES_PASSWORD=${DATABASE_PASSWORD:-postgres}
     deploy:
       replicas: 2 # Два воркера для старта
 
-  # 3. Наш веб-сервис
+  # 3. FastAPI веб-сервис
   api:
     image: weather-app
     build: .
@@ -36,9 +68,65 @@ services:
     ports:
       - "8000:8000"
     environment:
-      - DASK_SCHEDULER_ADDRESS=dask-scheduler:8786
+      - DASK_SCHEDULER_ADDRESS=${DASK_SCHEDULER_ADDRESS:-dask-scheduler:8786}
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_DB=${DATABASE_NAME:-weather_db}
+      - POSTGRES_USER=${DATABASE_USERNAME:-postgres}
+      - POSTGRES_PASSWORD=${DATABASE_PASSWORD:-postgres}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      dask-scheduler:
+        condition: service_started
     networks:
       - data-net
+
+  # 4. Prefect Server (оркестрация ETL)
+  prefect-server:
+    image: weather-app
+    build: .
+    command: bash -c "prefect server start --host 0.0.0.0 & sleep 5 && python -m app.prefect_flow"
+    ports:
+      - "4201:4200" # Prefect UI (изменен внешний порт на 4201)
+    networks:
+      - data-net
+    environment:
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_DB=${DATABASE_NAME:-weather_db}
+      - POSTGRES_USER=${DATABASE_USERNAME:-postgres}
+      - POSTGRES_PASSWORD=${DATABASE_PASSWORD:-postgres}
+      - DASK_SCHEDULER_ADDRESS=${DASK_SCHEDULER_ADDRESS:-dask-scheduler:8786}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      dask-scheduler:
+        condition: service_started
+
+  # 5. Streamlit приложение (визуализация)
+  streamlit:
+    image: weather-app
+    build: .
+    command: streamlit run app/streamlit_app.py --server.port=8501 --server.address=0.0.0.0
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./data:/data
+    environment:
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_DB=${DATABASE_NAME:-weather_db}
+      - POSTGRES_USER=${DATABASE_USERNAME:-postgres}
+      - POSTGRES_PASSWORD=${DATABASE_PASSWORD:-postgres}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - data-net
+
+volumes:
+  postgres_data:
 
 networks:
   data-net:
