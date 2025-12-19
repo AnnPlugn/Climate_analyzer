@@ -1,6 +1,8 @@
 import os
 import requests
 import pandas as pd
+import numpy as np
+import math
 import dask.dataframe as dd
 from fastapi import FastAPI, HTTPException
 from dask.distributed import Client
@@ -8,6 +10,10 @@ import time
 import datetime
 from datetime import datetime, timedelta
 from app.database import init_db, save_dataframe_to_db, get_aggregated_data, clear_table
+import logging
+
+
+logger = logging.getLogger("uvicorn")
 
 app = FastAPI(title="Weather Dask ETL")
 
@@ -17,6 +23,22 @@ DATA_DIR = "/data"
 
 # Инициализация базы данных при старте
 init_db()
+
+from dask.distributed import Client
+import os
+
+async def get_client_async():
+    """Асинхронное получение Dask-клиента"""
+    scheduler_address = os.getenv("DASK_SCHEDULER_ADDRESS", "dask-scheduler:8786")
+    try:
+        # Асинхронное подключение
+        return await Client(scheduler_address, asynchronous=True)
+    except Exception as e:
+        logger.error(f"Dask connection failed: {str(e)}")
+        raise HTTPException(
+            status_code=503,
+            detail=f"Service unavailable: Dask cluster not ready ({str(e)})"
+        )
 
 # Координаты городов для анализа
 CITIES = {
@@ -85,7 +107,11 @@ async def ingest_data(start_date: str = "2023-01-01", end_date: str = "2023-12-3
         }
         
         # Запрос к API
-        response = requests.get(url, params=params)
+        try:
+            response = requests.get(url, params=params, timeout=30)
+        except requests.exceptions.RequestException as exc:
+            summary.append(f"Error fetching data for {city_name}: {exc}")
+            continue
         if response.status_code != 200:
             summary.append(f"Error fetching data for {city_name}: {response.status_code}")
             continue
@@ -148,90 +174,149 @@ async def ingest_data(start_date: str = "2023-01-01", end_date: str = "2023-12-3
 
 @app.get("/etl/analyze")
 async def analyze_weather():
-    """
-    ETL Step 2: Transform с расширенными агрегациями
-    """
-    client = get_client()
+    """ETL Step 2: Transform с расширенными агрегациями (асинхронная версия)"""
+    start_time = time.time()
     
+    # 1. Получаем асинхронный клиент
+    client = await get_client_async()
+    
+    # 2. Читаем данные
     try:
         ddf = dd.read_csv(f"{DATA_DIR}/*.csv")
     except OSError:
-        raise HTTPException(status_code=404, detail="No data found. Run /etl/ingest first.")
+        logger.error("No CSV files found in data directory")
+        raise HTTPException(
+            status_code=404, 
+            detail="No data found. Run /etl/ingest first."
+        )
     
-    # Расширенная агрегация данных
-    agg_operations = {
+    # 3. Базовые агрегаты, соответствующие схеме weather_aggregated
+    agg_spec = {
         "temperature": ["mean", "max", "min"],
-        "apparent_temperature": ["mean"],
-        "dewpoint_2m": ["mean"],
-        "humidity": ["mean"],
-        "precipitation": ["sum"],
-        "rain": ["sum"],
-        "showers": ["sum"],
-        "snowfall": ["sum"],
-        "wind_speed": ["mean"],
-        "wind_gusts_10m": ["max", "mean"],
-        "pressure": ["mean"],
-        "cloud_cover": ["mean"],
-        "weather_code": lambda x: x.mode().iloc[0] if not x.mode().empty else None,
-        "shortwave_radiation": ["mean"],
-        "sunshine_duration": ["sum"],
-        "uv_index": ["max"],
+        "apparent_temperature": "mean",
+        "dewpoint_2m": "mean",
+        "humidity": "mean",
+        "precipitation": "sum",
+        "rain": "sum",
+        "showers": "sum",
+        "snowfall": "sum",
+        "snow_depth": "max",
+        "wind_speed": "mean",
+        "wind_gusts_10m": "max",
+        "pressure": "mean",
+        "cloud_cover": "mean",
+        "cloud_cover_low": "mean",
+        "cloud_cover_mid": "mean",
+        "cloud_cover_high": "mean",
+        "shortwave_radiation": "mean",
+        "sunshine_duration": "sum",
+        "uv_index": "max",
     }
     
-    # Группировка и агрегация
-    aggregation = ddf.groupby("city").agg(agg_operations)
+    grouped = ddf.groupby("city")
+    agg_df = grouped.agg(agg_spec)
     
-    # Вычисление
-    start = time.time()
-    result = aggregation.compute()
-    duration = time.time() - start
+    # Дополнительные метрики считаем параллельно
+    result_future = client.compute(agg_df)
+    count_future = client.compute(grouped.size())
+    precip_future = client.compute(ddf[ddf["precipitation"] > 0.1].groupby("city").size())
+    snow_future = client.compute(ddf[ddf["snowfall"] > 0.1].groupby("city").size())
     
-    # Форматирование результата
-    result.columns = ['_'.join(col).strip() for col in result.columns.values]
-    result_for_db = result.reset_index()
+    try:
+        result, data_points, precip_days, snow_days = await client.gather(
+            [result_future, count_future, precip_future, snow_future]
+        )
+    except Exception as e:
+        logger.exception("Dask computation failed")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Analysis failed: {str(e)}"
+        )
     
-    # Добавление дополнительных вычисляемых полей
-    result_for_db['last_updated'] = datetime.utcnow()
-    result_for_db['data_points_count'] = ddf.groupby('city').size().compute().values
-    result_for_db['days_with_precipitation'] = ddf[ddf['precipitation'] > 0.1].groupby('city').size().compute().values
-    result_for_db['days_with_snow'] = ddf[ddf['snowfall'] > 0.1].groupby('city').size().compute().values
-    
-    # Переименование колонок для соответствия структуре БД
-    column_mapping = {
-        'city': 'city',
-        'temperature_mean': 'temp_mean',
-        'temperature_max': 'temp_max',
-        'temperature_min': 'temp_min',
-        'apparent_temperature_mean': 'apparent_temp_mean',
-        'dewpoint_2m_mean': 'dewpoint_mean',
-        'humidity_mean': 'humidity_mean',
-        'precipitation_sum': 'precipitation_sum',
-        'rain_sum': 'rain_sum',
-        'showers_sum': 'showers_sum',
-        'snowfall_sum': 'snowfall_sum',
-        'wind_speed_mean': 'wind_speed_mean',
-        'wind_gusts_10m_max': 'wind_gusts_max',
-        'pressure_mean': 'pressure_mean',
-        'cloud_cover_mean': 'cloud_cover_mean',
-        'weather_code_<lambda>': 'weather_code_most_common',
-        'shortwave_radiation_mean': 'shortwave_radiation_mean',
-        'sunshine_duration_sum': 'sunshine_hours_total',
-        'uv_index_max': 'uv_index_max',
+    # Приводим структуру к плоскому виду и ожидаемым именам колонок
+    result.columns = [
+        "_".join(col) if isinstance(col, tuple) else col
+        for col in result.columns
+    ]
+    result = result.reset_index()
+    rename_map = {
+        "temperature_mean": "temp_mean",
+        "temperature_max": "temp_max",
+        "temperature_min": "temp_min",
+        "apparent_temperature_mean": "apparent_temp_mean",
+        "dewpoint_2m_mean": "dewpoint_mean",
+        "humidity_mean": "humidity_mean",
+        "precipitation_sum": "precipitation_sum",
+        "rain_sum": "rain_sum",
+        "showers_sum": "showers_sum",
+        "snowfall_sum": "snowfall_sum",
+        "snow_depth_max": "snow_depth_max",
+        "wind_speed_mean": "wind_speed_mean",
+        "wind_gusts_10m_max": "wind_gusts_max",
+        "pressure_mean": "pressure_mean",
+        "cloud_cover_mean": "cloud_cover_mean",
+        "cloud_cover_low_mean": "cloud_cover_low_mean",
+        "cloud_cover_mid_mean": "cloud_cover_mid_mean",
+        "cloud_cover_high_mean": "cloud_cover_high_mean",
+        "shortwave_radiation_mean": "shortwave_radiation_mean",
+        "sunshine_duration_sum": "sunshine_hours_total",
+        "uv_index_max": "uv_index_max",
     }
+    result = result.rename(columns=rename_map)
     
-    # Применение маппинга имен колонок
-    result_for_db = result_for_db.rename(columns=column_mapping)
+    # Добавляем рассчитанные счетчики
+    result = (
+        result
+        .set_index("city")
+        .join(data_points.rename("data_points_count"), how="left")
+        .join(precip_days.rename("days_with_precipitation"), how="left")
+        .join(snow_days.rename("days_with_snow"), how="left")
+        .reset_index()
+    )
     
-    # Очистка и сохранение агрегированных данных
-    clear_table("weather_aggregated")
-    save_dataframe_to_db(result_for_db, "weather_aggregated")
+    # Преобразуем секунды солнечного сияния в часы для читаемости
+    if "sunshine_hours_total" in result.columns:
+        result["sunshine_hours_total"] = result["sunshine_hours_total"] / 3600.0
+    
+    # Метаданные и безопасные значения для JSON
+    result["last_updated"] = datetime.utcnow()
+    result = result.replace([np.inf, -np.inf], np.nan)
+    result = result.where(pd.notnull(result), None)
+    
+    # Сохранение в БД (синхронно)
+    try:
+        clear_table("weather_aggregated")
+        save_dataframe_to_db(result, "weather_aggregated")
+    except Exception as e:
+        logger.exception("Database operation failed")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Database error: {str(e)}"
+        )
+    
+    # Формирование ответа
+    duration = time.time() - start_time
+    
+    # Жесткая очистка NaN/inf перед возвратом
+    records = []
+    for rec in result.to_dict(orient="records"):
+        cleaned = {}
+        for k, v in rec.items():
+            if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
+                cleaned[k] = None
+            elif isinstance(v, (np.floating, np.float32, np.float64)) and (math.isnan(float(v)) or math.isinf(float(v))):
+                cleaned[k] = None
+            elif isinstance(v, (pd.Timestamp, np.datetime64)):
+                cleaned[k] = pd.to_datetime(v).isoformat()
+            else:
+                cleaned[k] = v
+        records.append(cleaned)
     
     return {
         "analysis_time_sec": round(duration, 4),
-        "workers_count": len(client.scheduler_info()['workers']) if client else 0,
-        "data": result_for_db.to_dict(orient="records")
+        "workers_count": len(client.scheduler_info()['workers']),
+        "data": records
     }
-
 @app.delete("/etl/clean")
 async def clean_data():
     """Очистка скачанных данных (CSV и PostgreSQL)"""
@@ -258,4 +343,3 @@ async def get_stats():
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-

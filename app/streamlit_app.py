@@ -94,6 +94,38 @@ def cached_get_aggregated_data():
         st.error(f"Ошибка загрузки агрегированных данных: {str(e)}")
         return pd.DataFrame()
 
+# Кэширование доступных городов из базы
+@st.cache_data(ttl=DATA_REFRESH_INTERVAL)
+def get_available_cities():
+    """Возвращает список городов, которые реально есть в БД"""
+    try:
+        # Сначала смотрим агрегаты (самый быстрый способ)
+        from app.database import engine
+        df = pd.read_sql("SELECT DISTINCT city FROM weather_aggregated ORDER BY city", engine)
+        cities = df["city"].tolist()
+        if cities:
+            return cities
+
+        # Фоллбек: берем уникальные города из raw-данных
+        df = pd.read_sql("SELECT DISTINCT city FROM weather_data ORDER BY city", engine)
+        return df["city"].tolist()
+    except Exception as e:
+        st.error(f"Ошибка получения списка городов: {str(e)}")
+        return []
+
+@st.cache_data(ttl=DATA_REFRESH_INTERVAL)
+def get_data_range():
+    """Минимальная и максимальная дата в таблице weather_data"""
+    try:
+        from app.database import engine
+        df = pd.read_sql("SELECT MIN(time) AS min_time, MAX(time) AS max_time FROM weather_data", engine)
+        if df.empty or pd.isnull(df.loc[0, "min_time"]):
+            return None, None
+        return pd.to_datetime(df.loc[0, "min_time"]), pd.to_datetime(df.loc[0, "max_time"])
+    except Exception as e:
+        st.error(f"Ошибка получения диапазона дат: {str(e)}")
+        return None, None
+
 # Кэширование функции загрузки данных
 @st.cache_data(ttl=DATA_REFRESH_INTERVAL)
 def cached_load_data(city=None, start_date=None, end_date=None, limit=10000):
@@ -147,12 +179,13 @@ st.markdown("---")
 st.sidebar.header("📊 Фильтры и настройки")
 
 # Выбор города
-all_cities = ["All"] + sorted(list(CITY_COORDINATES.keys()))
+available_cities = get_available_cities()
+all_cities = ["All"] + available_cities
 selected_city = st.sidebar.selectbox("Выберите город", all_cities, index=0)
 
 # Фильтры по времени
 st.sidebar.subheader("⏰ Диапазон времени")
-time_filter_type = st.sidebar.radio("Тип фильтра", ["Последние данные", "Произвольный период"])
+time_filter_type = st.sidebar.radio("Тип фильтра", ["Произвольный период"])
 
 if time_filter_type == "Последние данные":
     time_periods = {
@@ -166,8 +199,21 @@ if time_filter_type == "Последние данные":
     end_date = datetime.now()
     start_date = end_date - timedelta(days=days_back)
 else:
-    start_date = st.sidebar.date_input("Начальная дата", datetime.now() - timedelta(days=30))
-    end_date = st.sidebar.date_input("Конечная дата", datetime.now())
+    data_min, data_max = get_data_range()
+    default_start = data_min.date() if data_min is not None else (datetime.now() - timedelta(days=30)).date()
+    default_end = data_max.date() if data_max is not None else datetime.now().date()
+    start_date = st.sidebar.date_input(
+        "Начальная дата",
+        default_start,
+        min_value=data_min.date() if data_min is not None else None,
+        max_value=data_max.date() if data_max is not None else None,
+    )
+    end_date = st.sidebar.date_input(
+        "Конечная дата",
+        default_end,
+        min_value=data_min.date() if data_min is not None else None,
+        max_value=data_max.date() if data_max is not None else None,
+    )
 
 # Количество записей для отображения
 limit = st.sidebar.slider("Максимум записей", 100, 50000, 5000, 100)
@@ -181,6 +227,40 @@ available_metrics = [
     "cloud_cover", "shortwave_radiation", "uv_index",
     "sunshine_duration"
 ]
+metric_labels = {
+    "temperature": "Температура",
+    "apparent_temperature": "Ощущаемая температура",
+    "dewpoint_2m": "Точка росы",
+    "humidity": "Влажность",
+    "precipitation": "Осадки",
+    "rain": "Дождь",
+    "showers": "Ливни",
+    "snowfall": "Снегопад",
+    "wind_speed": "Скорость ветра",
+    "wind_gusts_10m": "Порывы ветра",
+    "pressure": "Давление",
+    "cloud_cover": "Облачность",
+    "shortwave_radiation": "Солнечная радиация",
+    "uv_index": "UV индекс",
+    "sunshine_duration": "Солнечное сияние",
+}
+metric_units = {
+    "temperature": "°C",
+    "apparent_temperature": "°C",
+    "dewpoint_2m": "°C",
+    "humidity": "%",
+    "precipitation": "мм",
+    "rain": "мм",
+    "showers": "мм",
+    "snowfall": "мм",
+    "wind_speed": "м/с",
+    "wind_gusts_10m": "м/с",
+    "pressure": "гПа",
+    "cloud_cover": "%",
+    "shortwave_radiation": "Вт/м²",
+    "uv_index": "",
+    "sunshine_duration": "с",
+}
 selected_metrics = st.sidebar.multiselect(
     "Выберите метрики",
     available_metrics,
@@ -203,6 +283,7 @@ try:
     else:
         # Преобразование времени
         df['time'] = pd.to_datetime(df['time'])
+        selected_metrics = [m for m in selected_metrics if m in df.columns]
         
         # Метрики
         st.subheader("📈 Ключевые показатели")
@@ -219,27 +300,11 @@ try:
         # Метрики для выбранных параметров
         for i, metric in enumerate(selected_metrics, 2):
             if metric in df.columns:
-                col_name = {
-                    "temperature": "Температура",
-                    "humidity": "Влажность",
-                    "precipitation": "Осадки",
-                    "wind_speed": "Скорость ветра",
-                    "pressure": "Давление",
-                    "cloud_cover": "Облачность"
-                }[metric]
-                
-                unit = {
-                    "temperature": "°C",
-                    "humidity": "%",
-                    "precipitation": "мм",
-                    "wind_speed": "м/с",
-                    "pressure": "гПа",
-                    "cloud_cover": "%"
-                }[metric]
-                
+                col_name = metric_labels.get(metric, metric)
+                unit = metric_units.get(metric, "")
                 avg_value = df[metric].mean()
                 with metric_cols[i]:
-                    st.metric(f"{col_name} (сред.)", f"{avg_value:.1f} {unit}")
+                    st.metric(f"{col_name} (сред.)", f"{avg_value:.1f} {unit}".strip())
         
         st.markdown("---")
         
@@ -265,14 +330,10 @@ try:
                         cols=1, 
                         shared_xaxes=True,
                         vertical_spacing=0.05, 
-                        subplot_titles=[{
-                            "temperature": "Температура (°C)",
-                            "humidity": "Влажность (%)",
-                            "precipitation": "Осадки (мм)",
-                            "wind_speed": "Скорость ветра (м/с)",
-                            "pressure": "Давление (гПа)",
-                            "cloud_cover": "Облачность (%)"
-                        }[m] for m in selected_metrics]
+                        subplot_titles=[
+                            f"{metric_labels.get(m, m)}" + (f" ({metric_units.get(m)})" if metric_units.get(m) else "")
+                            for m in selected_metrics
+                        ]
                     )
                     
                     row = 1
@@ -284,14 +345,7 @@ try:
                                 go.Scatter(
                                     x=city_df['time'],
                                     y=city_df[metric],
-                                    name={
-                                        "temperature": "Температура",
-                                        "humidity": "Влажность",
-                                        "precipitation": "Осадки",
-                                        "wind_speed": "Скорость ветра",
-                                        "pressure": "Давление",
-                                        "cloud_cover": "Облачность"
-                                    }[metric],
+                                    name=metric_labels.get(metric, metric),
                                     line=dict(color=colors[i % len(colors)], width=2),
                                     mode='lines'
                                 ),

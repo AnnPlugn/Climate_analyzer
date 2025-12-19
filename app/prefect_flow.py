@@ -3,16 +3,18 @@ Prefect Flow для оркестрации ETL процесса
 """
 
 import os
-from prefect import flow, task
-import requests
-import pandas as pd
-import dask.dataframe as dd
-from dask.distributed import Client
-from datetime import datetime
-from app.database import init_db, save_dataframe_to_db, clear_table
-from app.fill_database import fill_database
 import datetime
 from datetime import datetime, timedelta
+
+import dask.dataframe as dd
+import pandas as pd
+import requests
+from dask.distributed import Client
+from prefect import flow, task
+from sqlalchemy import text
+
+from app.database import init_db, save_dataframe_to_db, clear_table, get_session
+from app.fill_database import fill_database
 
 # Настройки
 DASK_SCHEDULER = os.getenv("DASK_SCHEDULER_ADDRESS", "127.0.0.1:8786")
@@ -221,7 +223,9 @@ def weather_etl_flow(start_date: str = "2023-01-01", end_date: str = "2023-12-31
         
         # Проверка наличия данных в базе
         session = get_session()
-        data_exists = session.execute("SELECT EXISTS(SELECT 1 FROM weather_data LIMIT 1)").scalar()
+        data_exists = session.execute(
+            text("SELECT EXISTS(SELECT 1 FROM weather_data LIMIT 1)")
+        ).scalar()
         session.close()
         
         # Если данных нет, запускаем полное заполнение
@@ -252,4 +256,3 @@ if __name__ == "__main__":
     # Запуск flow локально
     result = weather_etl_flow("2023-01-01", "2023-01-31")
     print(result)
-
