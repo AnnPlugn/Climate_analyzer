@@ -5,4 +5,10 @@ pandas
 dask[complete]
 lz4
 pyarrow
-
+streamlit
+plotly
+prefect
+sqlalchemy
+psycopg2-binary
+python-dotenv
+python-multipart
