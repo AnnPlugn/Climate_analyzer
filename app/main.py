@@ -180,9 +180,14 @@ async def analyze_weather():
     # 1. Получаем асинхронный клиент
     client = await get_client_async()
     
-    # 2. Читаем данные
+    # 2. Читаем данные с оптимизацией
     try:
-        ddf = dd.read_csv(f"{DATA_DIR}/*.csv")
+        # Используем более эффективное чтение
+        ddf = dd.read_csv(
+            f"{DATA_DIR}/*.csv",
+            parse_dates=['time'],
+            blocksize='64MB'  # Оптимальный размер блока для чтения
+        )
     except OSError:
         logger.error("No CSV files found in data directory")
         raise HTTPException(
@@ -213,12 +218,14 @@ async def analyze_weather():
         "uv_index": "max",
     }
     
+    # Оптимизируем: группируем и агрегируем
     grouped = ddf.groupby("city")
     agg_df = grouped.agg(agg_spec)
     
-    # Дополнительные метрики считаем параллельно
+    # Вычисляем все метрики параллельно
     result_future = client.compute(agg_df)
     count_future = client.compute(grouped.size())
+    # Упрощаем дополнительные метрики для ускорения
     precip_future = client.compute(ddf[ddf["precipitation"] > 0.1].groupby("city").size())
     snow_future = client.compute(ddf[ddf["snowfall"] > 0.1].groupby("city").size())
     
@@ -265,14 +272,21 @@ async def analyze_weather():
     result = result.rename(columns=rename_map)
     
     # Добавляем рассчитанные счетчики
-    result = (
-        result
-        .set_index("city")
-        .join(data_points.rename("data_points_count"), how="left")
-        .join(precip_days.rename("days_with_precipitation"), how="left")
-        .join(snow_days.rename("days_with_snow"), how="left")
-        .reset_index()
-    )
+    result = result.set_index("city")
+    result = result.join(data_points.rename("data_points_count"), how="left")
+    
+    # Добавляем дополнительные метрики, если они есть
+    if len(precip_days) > 0:
+        result = result.join(precip_days.rename("days_with_precipitation"), how="left")
+    else:
+        result["days_with_precipitation"] = 0
+    
+    if len(snow_days) > 0:
+        result = result.join(snow_days.rename("days_with_snow"), how="left")
+    else:
+        result["days_with_snow"] = 0
+    
+    result = result.reset_index()
     
     # Преобразуем секунды солнечного сияния в часы для читаемости
     if "sunshine_hours_total" in result.columns:
@@ -336,10 +350,62 @@ async def get_stats():
     """Получение статистики из PostgreSQL"""
     try:
         aggregated = get_aggregated_data()
+        
+        # Очистка данных от NaN и inf для JSON сериализации
+        aggregated = aggregated.replace([np.inf, -np.inf], np.nan)
+        aggregated = aggregated.fillna(None)  # Заменяем все NaN на None
+        
+        # Преобразуем в словари с очисткой некорректных значений
+        records = []
+        for rec in aggregated.to_dict(orient="records"):
+            cleaned = {}
+            for k, v in rec.items():
+                try:
+                    # Пропускаем id колонку
+                    if k == 'id':
+                        continue
+                    
+                    # Проверяем на None
+                    if v is None:
+                        cleaned[k] = None
+                        continue
+                    
+                    # Проверяем на float и его подтипы
+                    if isinstance(v, (float, np.floating, np.float32, np.float64)):
+                        try:
+                            v_float = float(v)
+                            if math.isnan(v_float) or math.isinf(v_float) or not (-1e308 < v_float < 1e308):
+                                cleaned[k] = None
+                            else:
+                                cleaned[k] = v_float
+                        except (ValueError, TypeError, OverflowError):
+                            cleaned[k] = None
+                    # Проверяем на datetime
+                    elif isinstance(v, (pd.Timestamp, np.datetime64, datetime)):
+                        try:
+                            cleaned[k] = pd.to_datetime(v).isoformat()
+                        except:
+                            cleaned[k] = None
+                    # Проверяем на NaN через pandas
+                    elif isinstance(v, (int, str, bool)):
+                        cleaned[k] = v
+                    else:
+                        # Для всех остальных типов пытаемся преобразовать
+                        try:
+                            if pd.isna(v):
+                                cleaned[k] = None
+                            else:
+                                cleaned[k] = v
+                        except:
+                            cleaned[k] = None
+                except Exception:
+                    cleaned[k] = None
+            records.append(cleaned)
+        
         return {
             "status": "success",
             "cities_count": len(aggregated),
-            "data": aggregated.to_dict(orient="records")
+            "data": records
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

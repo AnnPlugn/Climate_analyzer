@@ -1,6 +1,7 @@
 import time
 from datetime import datetime, timedelta
 import pandas as pd
+from sqlalchemy import text
 from app.database import init_db, save_dataframe_to_db, engine, get_session
 from app.main import CITIES
 import requests
@@ -12,7 +13,7 @@ def wait_for_database(max_attempts=30, delay=2):
         try:
             init_db()
             session = get_session()
-            session.execute("SELECT 1")
+            session.execute(text("SELECT 1"))
             session.close()
             print("✅ База данных готова к работе")
             return True

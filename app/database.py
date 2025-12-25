@@ -185,27 +185,62 @@ def update_table_schema():
         if 'weather_aggregated' in inspector.get_table_names():
             current_columns = [col['name'] for col in inspector.get_columns('weather_aggregated')]
             
+            # Все колонки из модели WeatherAggregated
             expected_columns = {
                 'city': String(50),
                 'temp_mean': Float,
                 'temp_max': Float,
                 'temp_min': Float,
+                'apparent_temp_mean': Float,
+                'dewpoint_mean': Float,
                 'humidity_mean': Float,
                 'precipitation_sum': Float,
+                'rain_sum': Float,
+                'showers_sum': Float,
+                'snowfall_sum': Float,
+                'snow_depth_max': Float,
                 'wind_speed_mean': Float,
+                'wind_gusts_max': Float,
+                'wind_direction_predominant': Float,
                 'pressure_mean': Float,
                 'cloud_cover_mean': Float,
+                'cloud_cover_low_mean': Float,
+                'cloud_cover_mid_mean': Float,
+                'cloud_cover_high_mean': Float,
+                'shortwave_radiation_mean': Float,
+                'sunshine_hours_total': Float,
+                'uv_index_max': Float,
+                'weather_code_most_common': Integer,
+                'days_with_precipitation': Integer,
+                'days_with_snow': Integer,
+                'heating_degree_days': Float,
+                'cooling_degree_days': Float,
+                'daytime_temp_mean': Float,
+                'nighttime_temp_mean': Float,
+                'jan_temp_mean': Float,
+                'jul_temp_mean': Float,
+                'data_points_count': Integer,
+                'data_coverage_percent': Float,
                 'last_updated': DateTime
             }
             
             for col_name, col_type in expected_columns.items():
                 if col_name not in current_columns:
                     print(f"Adding missing column {col_name} to weather_aggregated")
-                    sql_type = "VARCHAR(50)" if isinstance(col_type, String) else \
-                              "TIMESTAMP" if isinstance(col_type, DateTime) else \
-                              "DOUBLE PRECISION"
-                    conn.execute(text(f"ALTER TABLE weather_aggregated ADD COLUMN {col_name} {sql_type}"))
-                    conn.commit()
+                    if isinstance(col_type, String):
+                        sql_type = "VARCHAR(50)"
+                    elif isinstance(col_type, DateTime):
+                        sql_type = "TIMESTAMP"
+                    elif isinstance(col_type, Integer):
+                        sql_type = "INTEGER"
+                    else:
+                        sql_type = "DOUBLE PRECISION"
+                    try:
+                        conn.execute(text(f"ALTER TABLE weather_aggregated ADD COLUMN {col_name} {sql_type}"))
+                        conn.commit()
+                    except Exception as e:
+                        print(f"Warning: Could not add column {col_name}: {str(e)}")
+                        conn.rollback()
                     
     finally:
         conn.close()
@@ -243,15 +278,40 @@ def save_dataframe_to_db(df: pd.DataFrame, table_name: str = "weather_data"):
     # Автоматически обновляем схему перед сохранением данных
     update_table_schema()
     
-    # Используем pandas to_sql для эффективной вставки
-    df.to_sql(
-        table_name,
-        engine,
-        if_exists='append',
-        index=False,
-        method='multi',
-        chunksize=1000
-    )
+    # Используем pandas to_sql с меньшим chunksize для избежания ошибок
+    # Уменьшаем chunksize до 100 для более стабильной работы
+    try:
+        inspector = inspect(engine)
+        table_exists = table_name in inspector.get_table_names()
+        rows_before = pd.read_sql(f"SELECT COUNT(*) as count FROM {table_name}", engine).iloc[0]['count'] if table_exists else 0
+        
+        df.to_sql(
+            table_name,
+            engine,
+            if_exists='append',
+            index=False,
+            method=None,  # Используем стандартный метод вместо 'multi'
+            chunksize=100  # Меньший размер батча
+        )
+        
+        rows_after = pd.read_sql(f"SELECT COUNT(*) as count FROM {table_name}", engine).iloc[0]['count']
+        print(f"Successfully saved {rows_after - rows_before} rows to {table_name} (total: {rows_after})")
+    except Exception as e:
+        # Если стандартный метод не работает, пробуем еще меньший chunksize
+        print(f"Warning: Error with chunksize=100, trying chunksize=50: {str(e)}")
+        try:
+            df.to_sql(
+                table_name,
+                engine,
+                if_exists='append',
+                index=False,
+                method=None,
+                chunksize=50
+            )
+            print(f"Successfully saved data to {table_name} with chunksize=50")
+        except Exception as e2:
+            print(f"Error saving to {table_name}: {str(e2)}")
+            raise
 
 def load_data_from_db(city: str = None, limit: int = None) -> pd.DataFrame:
     """
